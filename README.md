@@ -85,6 +85,25 @@ docker compose up --build
 - 检索按页做键集分页：不缓存全量命中行、不跨请求持有数据库事务，
   WAL 下检索与上传提交互不阻塞。
 
+### `GET /logs/duplicates` — 统计批次区间内的重复消息
+
+按**提交顺序**取 `[from_batch, to_batch]` **闭区间**（两端相同表示只看单个
+批次），在区间内按 `message` **原文**分组：大小写、空白、Unicode 码点
+差异都算不同消息（SQLite BINARY 核），且**不按 id 去重**——批内与跨批的
+每一行各计一次。
+
+- 参数：`from_batch`、`to_batch`（必填，批次 ID）；`limit`（1～100 的整数，
+  默认 100）、`offset`（非负整数，默认 0）。
+- 任一端批次未知返回 `404`；起点晚于终点（按提交顺序）或参数非法返回
+  `422`。
+- 只返回出现至少两次的消息，每项含 `message`、`occurrences`（区间内的
+  总行数）、`batch_count`（出现的不同批次数）。按 `occurrences` 降序、
+  再按 `message` 的 BINARY 顺序升序分页；`total` 为分页前的分组总数，
+  越界页或无重复时 `items` 为空列表。
+- 统计只覆盖该闭区间：区间由两个批次 ID 固定，之后上传的新批次不会改变
+  相同参数的结果；暂存中（未提交）的批次不参与。分组聚合在 SQLite 内
+  完成，不会把区间内的日志载入 Python 内存。
+
 ## curl 示例
 
 ### 正常：上传并读回
@@ -146,6 +165,57 @@ curl -sS -G http://localhost:8000/logs/search \
 docker compose restart api
 curl -sS -G http://localhost:8000/logs/search \
   --data-urlencode "cursor=$CUR" --data-urlencode 'page_size=1'
+```
+
+### 重复消息统计：闭区间、分页、404/422
+
+```bash
+# 上传两个含重复消息的批次，记下各自的 batch_id
+printf '%s\n' \
+  '{"id":"a","message":"disk full"}' \
+  '{"id":"b","message":"Disk full"}' \
+  '{"id":"c","message":"disk full"}' \
+  | gzip -n > d1.json.gz
+D1=$(curl -sS -X POST http://localhost:8000/batches --data-binary @d1.json.gz \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+printf '%s\n' \
+  '{"id":"a","message":"disk full"}' \
+  '{"id":"b","message":"disk full "}' \
+  '{"id":"c","message":"disk full "}' \
+  | gzip -n > d2.json.gz
+D2=$(curl -sS -X POST http://localhost:8000/batches --data-binary @d2.json.gz \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+# 统计 [D1, D2] 闭区间内的重复消息（limit/offset 分页）
+curl -sS -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "from_batch=$D1" --data-urlencode "to_batch=$D2" \
+  --data-urlencode 'limit=10' --data-urlencode 'offset=0'
+# -> {"from_batch":"…","to_batch":"…","total":2,"limit":10,"offset":0,"items":[
+#      {"message":"disk full","occurrences":3,"batch_count":2},
+#      {"message":"disk full ","occurrences":2,"batch_count":1}]}
+# "Disk full"（大写 D）只出现 1 次，不在结果中；"disk full" 与
+# "disk full "（尾随空格）是两个不同的组；同一 id "a" 跨批不去重。
+
+# 两端相同：只看单个批次
+curl -sS -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "from_batch=$D1" --data-urlencode "to_batch=$D1"
+
+# 区间固定：再上传新批次后，相同参数的结果不变；把 to_batch 换成
+# 新批次 ID 才会把它纳入统计。
+
+# 404：任一端批次未知
+curl -sS -o /dev/null -w '%{http_code}\n' -G http://localhost:8000/logs/duplicates \
+  --data-urlencode 'from_batch=does-not-exist' --data-urlencode "to_batch=$D1"
+
+# 422：起点晚于终点（按提交顺序）
+curl -sS -o /dev/null -w '%{http_code}\n' -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "from_batch=$D2" --data-urlencode "to_batch=$D1"
+
+# 422：参数非法（limit 超出 1..100 / offset 为负 / 缺参数等）
+curl -sS -o /dev/null -w '%{http_code}\n' -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "from_batch=$D1" --data-urlencode "to_batch=$D2" \
+  --data-urlencode 'limit=0'
 ```
 
 ### 失败示例

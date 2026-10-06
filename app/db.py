@@ -105,6 +105,14 @@ def get_batch(conn: sqlite3.Connection, batch_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def get_batch_rowid(conn: sqlite3.Connection, batch_id: str) -> int | None:
+    """批次的提交顺序号（batches.rowid）；未知 ID 返回 None。"""
+    row = conn.execute(
+        "SELECT rowid FROM batches WHERE id = ?", (batch_id,)
+    ).fetchone()
+    return None if row is None else row["rowid"]
+
+
 def get_lines(
     conn: sqlite3.Connection, batch_id: str, limit: int, offset: int
 ) -> list[sqlite3.Row]:
@@ -166,6 +174,47 @@ def search_lines(
             "limit": limit,
         },
     ).fetchall()
+
+
+# 重复消息统计的公共子查询：在 [lo, hi]（batches.rowid，含两端）内按
+# message 原文分组。TEXT 默认 BINARY 核对大小写、空白与 Unicode 码点
+# 逐字节区分；不按 id 去重，批内与跨批的每一行各计一次；只保留出现
+# 至少两次的组。
+_DUPLICATES_GROUPED = """
+    SELECT l.message AS message,
+           COUNT(*) AS occurrences,
+           COUNT(DISTINCT l.batch_id) AS batch_count
+    FROM batches b CROSS JOIN lines l ON l.batch_id = b.id
+    WHERE b.rowid BETWEEN :lo AND :hi
+    GROUP BY l.message
+    HAVING COUNT(*) >= 2
+"""
+
+
+def duplicate_messages(
+    conn: sqlite3.Connection, lo: int, hi: int, limit: int, offset: int
+) -> tuple[list[sqlite3.Row], int]:
+    """统计 [lo, hi] 闭区间内的重复消息，返回 (当前页行, 分页前分组总数)。
+
+    分组、过滤、排序、分页全部在 SQLite 内完成：Python 侧只接收当前页
+    （<= limit 行）和一个计数，不会把区间内的日志行载入内存。区间由批次
+    rowid 固定，之后提交的批次（rowid 更大）不影响结果。排序为
+    occurrences 降序、再按 message 的 BINARY 顺序升序；组内 message 唯一，
+    次序确定，分页稳定。
+    """
+    total = conn.execute(
+        f"SELECT COUNT(*) AS c FROM ({_DUPLICATES_GROUPED})",
+        {"lo": lo, "hi": hi},
+    ).fetchone()["c"]
+    rows = conn.execute(
+        _DUPLICATES_GROUPED
+        + """
+        ORDER BY occurrences DESC, message COLLATE BINARY
+        LIMIT :limit OFFSET :offset
+        """,
+        {"lo": lo, "hi": hi, "limit": limit, "offset": offset},
+    ).fetchall()
+    return rows, total
 
 
 @contextmanager

@@ -217,3 +217,54 @@ def search_logs(
             "next_cursor": next_cursor,
         }
     )
+
+
+# --------------------------------------------------------------------------- #
+# 重复消息统计：已提交批次闭区间内的 message 分组计数
+# --------------------------------------------------------------------------- #
+@app.get("/logs/duplicates")
+def duplicate_logs(
+    from_batch: str = Query(...),
+    to_batch: str = Query(...),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> JSONResponse:
+    """统计 [from_batch, to_batch] 闭区间（按提交顺序，两端相同亦可）内的重复消息。
+
+    按 message 原文分组：大小写、空白、Unicode 码点差异都算不同消息；不按
+    id 去重，批内与跨批的每一行各计一次。只返回出现至少两次的组，每项含
+    occurrences（区间内行数）与 batch_count（出现的不同批次数）。按
+    occurrences 降序、再按 message 的 SQLite BINARY 顺序升序分页；total 为
+    分页前的分组总数，越界页或无重复时 items 为空。未知批次返回 404，起点
+    晚于终点或参数非法返回 422。区间由两个批次 ID 固定，之后上传的新批次
+    不改变相同参数的结果；暂存中的批次不参与。分组聚合在 SQLite 内完成，
+    不把区间内的日志载入 Python 内存。
+    """
+    with db.session() as conn:
+        lo = db.get_batch_rowid(conn, from_batch)
+        hi = db.get_batch_rowid(conn, to_batch)
+        if lo is None or hi is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        if lo > hi:
+            raise HTTPException(
+                status_code=422,
+                detail="from_batch must not be after to_batch in commit order",
+            )
+        rows, total = db.duplicate_messages(conn, lo, hi, limit, offset)
+    return JSONResponse(
+        {
+            "from_batch": from_batch,
+            "to_batch": to_batch,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [
+                {
+                    "message": row["message"],
+                    "occurrences": row["occurrences"],
+                    "batch_count": row["batch_count"],
+                }
+                for row in rows
+            ],
+        }
+    )

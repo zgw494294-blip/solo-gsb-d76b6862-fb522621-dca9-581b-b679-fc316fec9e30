@@ -490,6 +490,121 @@ def main():
           [i["id"] for i in r.json()["items"]] == ["m3", "m4", "m5"],
           r.text[:200])
 
+    print("== 重复消息统计 ==")
+    # 批次 A：alpha×2（同批不同 id）、Alpha（大小写不同）、beta（只一次）、
+    # "gamma "（尾随空格）、"gamma"（无空格，只一次）、café（组合字符 é，一次）
+    da = [
+        {"id": "d1", "message": f"{tok} alpha"},
+        {"id": "d2", "message": f"{tok} alpha"},
+        {"id": "d3", "message": f"{tok} Alpha"},
+        {"id": "d4", "message": f"{tok} beta"},
+        {"id": "d5", "message": f"{tok} gamma "},
+        {"id": "d6", "message": f"{tok} gamma"},
+        {"id": "u1", "message": f"{tok} caf\u00e9"},
+    ]
+    r = c.post("/batches", content=gz(ndjson(da)))
+    check("dup fixture A -> 201", r.status_code == 201, r.text)
+    ba = r.json()["batch_id"]
+
+    # 批次 B：alpha（id 与 A.d1 相同，跨批不去重）、Alpha、"gamma "、δ×2、
+    # café（分解形式 e+U+0301，与组合形式是不同码点序列）
+    dbf = [
+        {"id": "d1", "message": f"{tok} alpha"},
+        {"id": "x1", "message": f"{tok} Alpha"},
+        {"id": "x2", "message": f"{tok} gamma "},
+        {"id": "x3", "message": f"{tok} δ"},
+        {"id": "x4", "message": f"{tok} δ"},
+        {"id": "u2", "message": f"{tok} cafe\u0301"},
+    ]
+    r = c.post("/batches", content=gz(ndjson(dbf)))
+    check("dup fixture B -> 201", r.status_code == 201, r.text)
+    bb = r.json()["batch_id"]
+
+    # 批次 C：只有一条唯一消息
+    r = c.post("/batches", content=gz(ndjson([{"id": "c1", "message": f"{tok} solo"}])))
+    check("dup fixture C -> 201", r.status_code == 201, r.text)
+    bc = r.json()["batch_id"]
+
+    def dups(**params):
+        return c.get("/logs/duplicates", params=params)
+
+    # occurrences 降序，同数按 message BINARY 升序：'A' < 'g' < 'δ'(U+03B4)
+    expected_items = [
+        {"message": f"{tok} alpha", "occurrences": 3, "batch_count": 2},
+        {"message": f"{tok} Alpha", "occurrences": 2, "batch_count": 2},
+        {"message": f"{tok} gamma ", "occurrences": 2, "batch_count": 2},
+        {"message": f"{tok} δ", "occurrences": 2, "batch_count": 1},
+    ]
+    r = dups(from_batch=ba, to_batch=bc, limit=100, offset=0)
+    check("dups 200", r.status_code == 200, r.text[:200])
+    body = r.json()
+    check("dups total groups before pagination", body["total"] == 4, body)
+    check("dups items ordered & counted (no id dedup, case/space/codepoint "
+          "sensitive)", body["items"] == expected_items, body["items"])
+    check("dups echo params",
+          body["from_batch"] == ba and body["to_batch"] == bc
+          and body["limit"] == 100 and body["offset"] == 0, body)
+
+    # 两端相同：只看单个批次
+    r = dups(from_batch=ba, to_batch=ba)
+    body = r.json()
+    check("single-batch interval", body["total"] == 1 and body["items"] == [
+        {"message": f"{tok} alpha", "occurrences": 2, "batch_count": 1}], body)
+    r = dups(from_batch=bc, to_batch=bc)
+    body = r.json()
+    check("no duplicates -> empty items + total 0",
+          body["total"] == 0 and body["items"] == [], body)
+
+    # 分页：越界页为空但 total 仍是分组总数
+    r = dups(from_batch=ba, to_batch=bc, limit=2, offset=0)
+    body = r.json()
+    check("dups page1", body["items"] == expected_items[:2]
+          and body["total"] == 4, body)
+    r = dups(from_batch=ba, to_batch=bc, limit=2, offset=2)
+    body = r.json()
+    check("dups page2", body["items"] == expected_items[2:]
+          and body["total"] == 4, body)
+    r = dups(from_batch=ba, to_batch=bc, limit=2, offset=4)
+    body = r.json()
+    check("dups out-of-range page -> empty, total kept",
+          body["items"] == [] and body["total"] == 4, body)
+
+    # 区间由批次 ID 固定：之后上传的新批次不改变相同参数的结果
+    snap = dups(from_batch=ba, to_batch=bc, limit=100, offset=0).json()
+    dd = [{"id": f"n{i}", "message": f"{tok} alpha"} for i in range(3)]
+    r = c.post("/batches", content=gz(ndjson(dd)))
+    check("dup fixture D -> 201", r.status_code == 201, r.text)
+    bd = r.json()["batch_id"]
+    body = dups(from_batch=ba, to_batch=bc, limit=100, offset=0).json()
+    check("later upload does not change closed-interval result",
+          body == snap, body)
+    body = dups(from_batch=ba, to_batch=bd, limit=100, offset=0).json()
+    check("extending interval includes new batch",
+          body["items"][0]["occurrences"] == 6
+          and body["items"][0]["batch_count"] == 3, body["items"][:1])
+
+    # 404 / 422
+    check("dups unknown from -> 404",
+          dups(from_batch="does-not-exist", to_batch=bc).status_code == 404)
+    check("dups unknown to -> 404",
+          dups(from_batch=ba, to_batch="does-not-exist").status_code == 404)
+    check("dups from after to -> 422",
+          dups(from_batch=bc, to_batch=ba).status_code == 422)
+    check("dups limit 0 -> 422",
+          dups(from_batch=ba, to_batch=bc, limit=0).status_code == 422)
+    check("dups limit 101 -> 422",
+          dups(from_batch=ba, to_batch=bc, limit=101).status_code == 422)
+    check("dups limit 100 ok",
+          dups(from_batch=ba, to_batch=bc, limit=100).status_code == 200)
+    check("dups negative offset -> 422",
+          dups(from_batch=ba, to_batch=bc, offset=-1).status_code == 422)
+    check("dups non-int limit -> 422",
+          dups(from_batch=ba, to_batch=bc, limit="abc").status_code == 422)
+    check("dups missing from_batch -> 422", dups(to_batch=bc).status_code == 422)
+    check("dups missing to_batch -> 422", dups(from_batch=ba).status_code == 422)
+    check("dups default limit/offset ok",
+          dups(from_batch=ba, to_batch=bc).status_code == 200)
+
     print("== 暂存清理 ==")
     import glob as _glob
     leftovers = _glob.glob(
