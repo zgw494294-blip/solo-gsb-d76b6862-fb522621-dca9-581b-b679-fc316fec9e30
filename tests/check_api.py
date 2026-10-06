@@ -490,6 +490,176 @@ def main():
           [i["id"] for i in r.json()["items"]] == ["m3", "m4", "m5"],
           r.text[:200])
 
+    print("== 批次区间重复消息 ==")
+    # 每个 message 都带本次运行唯一前缀，避免与历史数据互相干扰
+    p = f"dupmark{tok}"
+    m_aa, m_bb, m_cc, m_qq = f"{p}aa", f"{p}bb", f"{p}cc", f"{p}qq"
+    m_uni = f"{p}\u00e9"       # 预组码点 U+00E9
+    m_case = f"{p}Aa"     # 与 m_aa 仅大小写不同
+    m_space = f"{p}aa "   # 与 m_aa 仅尾随空白不同
+    dup_batches = []
+    dup_specs = [
+        # 提交顺序即批次 rowid 顺序
+        [("d1", m_aa), ("d2", m_aa), ("d3", m_bb)],
+        [("d1", m_aa), ("d2", m_cc), ("d3", m_uni), ("d4", m_qq)],
+        [("d1", m_bb), ("d2", m_qq), ("d3", m_case)],
+    ]
+    for spec in dup_specs:
+        r = c.post("/batches",
+                   content=gz(ndjson([{"id": i, "message": m} for i, m in spec])))
+        check("dup fixture upload -> 201", r.status_code == 201, r.text[:150])
+        dup_batches.append(r.json()["batch_id"])
+    b1, b2, b3 = dup_batches
+
+    def dup(params):
+        return c.get("/logs/duplicates", params=params)
+
+    def tuples(body):
+        return [(i["message"], i["occurrences"], i["batch_count"])
+                for i in body["items"]]
+
+    def bin_sorted_ties(rows):
+        """occurrences 降序、同次数按 UTF-8 字节序的参考排序。"""
+        return sorted(rows, key=lambda t: (-t[1], t[0].encode("utf-8")))
+
+    # 三批合计：aa 3 次跨 2 批；bb/qq 各 2 次跨 2 批；cc/uni/Aa 各 1 次
+    r = dup({"start_batch_id": b1, "end_batch_id": b3})
+    check("duplicates 200", r.status_code == 200, r.text[:200])
+    body = r.json()
+    got = tuples(body)
+    check("duplicates groups & counts",
+          got == [(m_aa, 3, 2), (m_bb, 2, 2), (m_qq, 2, 2)], got)
+    check("duplicates item fields",
+          all(set(i) == {"message", "occurrences", "batch_count"}
+              for i in body["items"]))
+    check("duplicates envelope fields",
+          set(body) == {"total", "limit", "offset", "items"}, set(body))
+    check("duplicates total before pagination", body["total"] == 3, body)
+    check("duplicates default limit/offset",
+          body["limit"] == 100 and body["offset"] == 0, body)
+
+    # 闭区间含两端：b2..b3 中 qq 在两端各一次，aa/bb 各只剩一次（被区间排除）
+    r = dup({"start_batch_id": b2, "end_batch_id": b3})
+    body = r.json()
+    check("closed range excludes outer batch",
+          tuples(body) == [(m_qq, 2, 2)] and body["total"] == 1, body)
+
+    # 允许两端相同：批内重复可查；无重复批次为空
+    r = dup({"start_batch_id": b1, "end_batch_id": b1})
+    body = r.json()
+    check("single-batch range counts within-batch duplicate",
+          tuples(body) == [(m_aa, 2, 1)] and body["total"] == 1, body)
+    r = dup({"start_batch_id": b2, "end_batch_id": b2})
+    body = r.json()
+    check("single batch without duplicates -> empty",
+          body["items"] == [] and body["total"] == 0, body)
+
+    # 大小写、空白与 Unicode 码点差异不合并：再传一批同形不同码点的消息
+    m_uni_split = f"{p}e\u0301"  # e + 组合重音 U+0301，与预组 U+00E9 不同码点序列
+    r = c.post("/batches", content=gz(ndjson([
+        {"id": "u1", "message": m_uni},
+        {"id": "u2", "message": m_uni_split},
+        {"id": "u3", "message": m_case},
+        {"id": "u4", "message": m_space},
+        {"id": "u5", "message": m_space},
+    ])))
+    check("case/codepoint fixture -> 201", r.status_code == 201, r.text[:150])
+    b4 = r.json()["batch_id"]
+    r = dup({"start_batch_id": b1, "end_batch_id": b4})
+    body = r.json()
+    got = tuples(body)
+    # Aa、aa(带空格)、预组 é 各成新组；若大小写/空白/码点被错误归一化，
+    # 这些组会并入 aa 或彼此合并（occurrences/batch_count 就会变）。
+    # 组合重音形态在区间内仅 1 次，不出现在结果里。
+    expected = bin_sorted_ties([
+        (m_aa, 3, 2),
+        (m_case, 2, 2),       # b3 + b4，未并入小写 aa
+        (m_space, 2, 1),      # b4 批内两次，未并入无空格 aa
+        (m_bb, 2, 2),
+        (m_qq, 2, 2),
+        (m_uni, 2, 2),        # b2 + b4，预组码点；未并入组合重音形态
+    ])
+    check("case, whitespace and codepoint differences kept distinct",
+          got == expected and body["total"] == len(expected), got)
+
+    # occurrences 降序 + BINARY 升序：造同次数多组，与 Python UTF-8 字节序对照
+    spec5 = [(f"t{i:02d}", f"{p}k{i%3}") for i in range(6)]  # k0/k1/k2 各 2 次
+    r = c.post("/batches", content=gz(ndjson(
+        [{"id": i, "message": m} for i, m in spec5])))
+    check("order fixture -> 201", r.status_code == 201, r.text[:150])
+    b5 = r.json()["batch_id"]
+    r = dup({"start_batch_id": b5, "end_batch_id": b5})
+    body = r.json()
+    msgs = [i["message"] for i in body["items"]]
+    check("BINARY tie order matches UTF-8 byte order",
+          msgs == sorted(msgs, key=lambda s: s.encode("utf-8"))
+          and all(i["occurrences"] == 2 for i in body["items"]), msgs)
+
+    # 分页：limit/offset 切片与全量一致，total 是分页前总数，越界页为空
+    all_body = dup({"start_batch_id": b1, "end_batch_id": b5}).json()
+    total_groups = all_body["total"]
+    # 整页排序必须与参考排序一致（occurrences 降序、BINARY 升序）
+    check("full range ordering",
+          tuples(all_body) == bin_sorted_ties(tuples(all_body))
+          and total_groups == len(all_body["items"]), all_body)
+    page_size = 2
+    full = []
+    for off in range(0, total_groups, page_size):
+        page = dup({"start_batch_id": b1, "end_batch_id": b5,
+                    "limit": page_size, "offset": off}).json()
+        check(f"page offset={off} echoes params",
+              page["limit"] == page_size and page["offset"] == off)
+        full.extend(tuples(page))
+    check("pages concatenate to full result", full == tuples(all_body), full)
+    over = dup({"start_batch_id": b1, "end_batch_id": b5,
+                "limit": page_size, "offset": total_groups}).json()
+    check("out-of-range page empty & total unchanged",
+          over["items"] == [] and over["total"] == total_groups, over)
+
+    # 404：未知批次（先于区间方向判断）
+    r = dup({"start_batch_id": "deadbeef", "end_batch_id": b1})
+    check("unknown start -> 404", r.status_code == 404, r.status_code)
+    r = dup({"start_batch_id": b1, "end_batch_id": "deadbeef"})
+    check("unknown end -> 404", r.status_code == 404, r.status_code)
+
+    # 422：起点晚于终点（两端都存在）
+    r = dup({"start_batch_id": b3, "end_batch_id": b1})
+    check("start later than end -> 422", r.status_code == 422, r.text[:120])
+
+    # 422：参数缺失 / 非法
+    check("missing start -> 422",
+          dup({"end_batch_id": b1}).status_code == 422)
+    check("missing end -> 422",
+          dup({"start_batch_id": b1}).status_code == 422)
+    check("missing both -> 422", dup({}).status_code == 422)
+    check("offset -1 -> 422",
+          dup({"start_batch_id": b1, "end_batch_id": b1,
+               "offset": -1}).status_code == 422)
+    check("limit 0 -> 422",
+          dup({"start_batch_id": b1, "end_batch_id": b1,
+               "limit": 0}).status_code == 422)
+    check("limit 101 -> 422",
+          dup({"start_batch_id": b1, "end_batch_id": b1,
+               "limit": 101}).status_code == 422)
+    check("limit non-int -> 422",
+          dup({"start_batch_id": b1, "end_batch_id": b1,
+               "limit": "x"}).status_code == 422)
+    check("limit 1 ok",
+          dup({"start_batch_id": b1, "end_batch_id": b1,
+               "limit": 1}).status_code == 200)
+    check("limit 100 ok",
+          dup({"start_batch_id": b1, "end_batch_id": b1,
+               "limit": 100}).status_code == 200)
+
+    # 快照：固定区间后再上传，相同参数结果不变
+    before_snap = dup({"start_batch_id": b1, "end_batch_id": b3}).json()
+    r = c.post("/batches", content=gz(ndjson(
+        [{"id": "late1", "message": m_aa}, {"id": "late2", "message": m_aa}])))
+    check("post-snapshot fixture -> 201", r.status_code == 201, r.text[:120])
+    after_snap = dup({"start_batch_id": b1, "end_batch_id": b3}).json()
+    check("later uploads do not change same-range result",
+          after_snap == before_snap, (before_snap, after_snap))
+
     print("== 暂存清理 ==")
     import glob as _glob
     leftovers = _glob.glob(

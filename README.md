@@ -85,6 +85,34 @@ docker compose up --build
 - 检索按页做键集分页：不缓存全量命中行、不跨请求持有数据库事务，
   WAL 下检索与上传提交互不阻塞。
 
+### `GET /logs/duplicates` — 批次区间内的重复消息
+
+在两个**已提交**批次按提交顺序构成的**闭区间**（含两端）内，按 `message`
+原文分组统计重复。分组保留大小写、空白与 Unicode 码点差异（即 SQLite
+BINARY 比较），**不按 `id` 去重**：同一条消息在批内重复、或在不同批次
+重复，每一行各计一次。暂存中（尚未提交）的批次不参与。
+
+参数：
+
+| 参数 | 要求 |
+|---|---|
+| `start_batch_id` | 区间起点批次 ID（必填） |
+| `end_batch_id` | 区间终点批次 ID（必填，允许与起点相同） |
+| `offset` | 非负整数，默认 `0` |
+| `limit` | `1～100` 的整数，默认 `100` |
+
+- 只返回出现 **至少两次**的消息；每项含 `message`、`occurrences`（区间内
+  总行数）、`batch_count`（出现过该消息的不同批次数）。
+- 排序：先按 `occurrences` **降序**，次数相同再按 `message` 的 SQLite
+  BINARY 顺序（等价于 UTF-8 字节序）**升序**，随后按该顺序 `limit/offset`
+  分页。
+- 响应中的 `total` 是**分页前**的分组总数；越界页或区间内没有任何重复时
+  `items` 为空列表。
+- 任一 ID 是未知批次返回 `404`；起点批次晚于终点批次提交，或参数缺失/非法
+  返回 `422`。
+- 区间由两端批次固定，之后上传的新批次不会改变相同参数的结果；聚合、排序
+  与分页全部在 SQLite 内完成，不会把区间内日志整体读入应用内存。
+
 ## curl 示例
 
 ### 正常：上传并读回
@@ -146,6 +174,62 @@ curl -sS -G http://localhost:8000/logs/search \
 docker compose restart api
 curl -sS -G http://localhost:8000/logs/search \
   --data-urlencode "cursor=$CUR" --data-urlencode 'page_size=1'
+```
+
+### 区间重复消息：上传三个批次并统计
+
+```bash
+# 批一：aa 批内重复两次，bb 一次
+printf '%s\n' \
+  '{"id":"1","message":"aa"}' \
+  '{"id":"2","message":"aa"}' \
+  '{"id":"3","message":"bb"}' | gzip -n > d1.json.gz
+B1=$(curl -sS -X POST http://localhost:8000/batches \
+  --data-binary @d1.json.gz | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+# 批二：aa 再出现一次（跨批重复），cc 只出现一次
+printf '%s\n' \
+  '{"id":"1","message":"aa"}' \
+  '{"id":"2","message":"cc"}' | gzip -n > d2.json.gz
+B2=$(curl -sS -X POST http://localhost:8000/batches \
+  --data-binary @d2.json.gz | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+# 批三：bb 跨批重复；"Aa" 与 "aa" 仅大小写不同，不合并
+printf '%s\n' \
+  '{"id":"1","message":"bb"}' \
+  '{"id":"2","message":"Aa"}' | gzip -n > d3.json.gz
+B3=$(curl -sS -X POST http://localhost:8000/batches \
+  --data-binary @d3.json.gz | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+# 闭区间 [B1, B3]：aa 3 次跨 2 批，bb 2 次跨 2 批；cc、Aa 各 1 次不返回
+curl -sS -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "start_batch_id=$B1" \
+  --data-urlencode "end_batch_id=$B3"
+# {"total":2,"limit":100,"offset":0,"items":[
+#   {"message":"aa","occurrences":3,"batch_count":2},
+#   {"message":"bb","occurrences":2,"batch_count":2}]}
+
+# 两端相同：只统计单个批次内部的重复（aa 在批一内出现 2 次）
+curl -sS -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "start_batch_id=$B1" --data-urlencode "end_batch_id=$B1"
+
+# 分页：occurrences 降序、BINARY 升序后取第 2 页
+curl -sS -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "start_batch_id=$B1" --data-urlencode "end_batch_id=$B3" \
+  --data-urlencode 'limit=1' --data-urlencode 'offset=1'
+
+# 404：未知批次
+curl -sS -o /dev/null -w '%{http_code}\n' -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "start_batch_id=$B1" --data-urlencode 'end_batch_id=deadbeef'
+
+# 422：起点晚于终点（B3 比 B1 晚提交）
+curl -sS -o /dev/null -w '%{http_code}\n' -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "start_batch_id=$B3" --data-urlencode "end_batch_id=$B1"
+
+# 422：limit 越界
+curl -sS -o /dev/null -w '%{http_code}\n' -G http://localhost:8000/logs/duplicates \
+  --data-urlencode "start_batch_id=$B1" --data-urlencode "end_batch_id=$B1" \
+  --data-urlencode 'limit=101'
 ```
 
 ### 失败示例

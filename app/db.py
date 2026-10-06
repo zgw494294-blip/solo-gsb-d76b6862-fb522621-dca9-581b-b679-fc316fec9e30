@@ -105,6 +105,15 @@ def get_batch(conn: sqlite3.Connection, batch_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def get_batch_rowid(conn: sqlite3.Connection, batch_id: str) -> int | None:
+    """批次按提交顺序的序号（batches.rowid）；未知 ID 返回 None。"""
+    row = conn.execute(
+        "SELECT rowid AS r FROM batches WHERE id = ?",
+        (batch_id,),
+    ).fetchone()
+    return row["r"] if row is not None else None
+
+
 def get_lines(
     conn: sqlite3.Connection, batch_id: str, limit: int, offset: int
 ) -> list[sqlite3.Row]:
@@ -164,6 +173,55 @@ def search_lines(
             "last_seq": last[1],
             "query": query,
             "limit": limit,
+        },
+    ).fetchall()
+
+
+def _duplicate_groups_sql() -> str:
+    """闭区间 [start_rowid, end_rowid] 内重复 message 分组的公共查询体。
+
+    按 message 原文（列默认 COLLATE BINARY，保留大小写、空白与 Unicode
+    码点差异）分组，不看 id：批内重复与跨批重复的每一行都计入 COUNT(*)。
+    分组、聚合计数与排序全部在 SQLite 内完成，LIMIT/OFFSET 只取当前页，
+    区间内的日志行不会整体进入 Python 内存。
+    """
+    return """
+        SELECT l.message AS message,
+               COUNT(*) AS occurrences,
+               COUNT(DISTINCT b.rowid) AS batch_count
+        FROM batches b CROSS JOIN lines l ON l.batch_id = b.id
+        WHERE b.rowid BETWEEN :start AND :end
+        GROUP BY l.message
+        HAVING COUNT(*) >= 2
+        ORDER BY occurrences DESC, message COLLATE BINARY ASC
+        """
+
+
+def count_duplicate_groups(
+    conn: sqlite3.Connection, start_rowid: int, end_rowid: int
+) -> int:
+    """分页前的重复分组总数（与 limit/offset 无关，越界页也是同一总数）。"""
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM (" + _duplicate_groups_sql() + ")",
+        {"start": start_rowid, "end": end_rowid},
+    ).fetchone()["c"]
+
+
+def list_duplicate_groups(
+    conn: sqlite3.Connection,
+    start_rowid: int,
+    end_rowid: int,
+    limit: int,
+    offset: int,
+) -> list[sqlite3.Row]:
+    """取重复分组的一页（occurrences 降序，message BINARY 升序）。"""
+    return conn.execute(
+        _duplicate_groups_sql() + " LIMIT :limit OFFSET :offset",
+        {
+            "start": start_rowid,
+            "end": end_rowid,
+            "limit": limit,
+            "offset": offset,
         },
     ).fetchall()
 

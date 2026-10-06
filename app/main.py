@@ -115,6 +115,60 @@ def get_batch_lines(
 
 
 # --------------------------------------------------------------------------- #
+# 批次区间重复消息
+# --------------------------------------------------------------------------- #
+@app.get("/logs/duplicates")
+def find_duplicates(
+    start_batch_id: str = Query(...),
+    end_batch_id: str = Query(...),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=100),
+) -> JSONResponse:
+    """统计两个已提交批次（含两端，按提交顺序成闭区间）之间的重复 message。
+
+    按 message 原文分组（保留大小写、空白与 Unicode 码点差异；不按 id
+    去重，批内与跨批的每一行各计一次），只返回出现至少两次的分组。
+    批次只增不改，闭区间由两端批次的 rowid 固定，之后新提交的批次
+    rowid 更大，不会改变相同参数的结果；暂存中的批次不在主库，不参与。
+    聚合、计数、排序与分页全部在 SQLite 内完成，不把区间日志载入 Python。
+
+    - 任一 batch_id 未知：404（先于区间方向判断）
+    - 起点批次晚于终点批次：422
+    - 排序：occurrences 降序，再按 message 的 SQLite BINARY 顺序升序
+    - total 为分页前的分组总数；越界页或无重复时 items 为空列表
+    """
+    with db.session() as conn:
+        start = db.get_batch_rowid(conn, start_batch_id)
+        if start is None:
+            raise HTTPException(status_code=404, detail="start batch not found")
+        end = db.get_batch_rowid(conn, end_batch_id)
+        if end is None:
+            raise HTTPException(status_code=404, detail="end batch not found")
+        if start > end:
+            raise HTTPException(
+                status_code=422,
+                detail="start_batch_id is committed after end_batch_id",
+            )
+        total = db.count_duplicate_groups(conn, start, end)
+        rows = db.list_duplicate_groups(conn, start, end, limit, offset)
+    return JSONResponse(
+        {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [
+                {
+                    "message": row["message"],
+                    "occurrences": row["occurrences"],
+                    "batch_count": row["batch_count"],
+                }
+                for row in rows
+            ],
+        }
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 日志检索：无状态游标（自包含、可重启后续用）+ 键集分页
 # --------------------------------------------------------------------------- #
 def _encode_cursor(query: str, boundary: int, last: tuple[int, int]) -> str:
